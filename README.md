@@ -1,52 +1,193 @@
 # FIX.Session
 
-**TODO: Add description**
+An initiator-side [FIX](https://www.fixtrading.org/standards/) session engine for Elixir.
+
+`FIX.Session` uses `:gen_statem` to manage connection lifecycle, FIX sequence numbers, logon/logout, heartbeats, gap recovery, persistence, and delivery of validated application messages. FIX 4.4 over TCP is the default configuration.
+
+> **Status:** Early development (`0.1.0`). The API and storage format may change. See [Current limitations](#current-limitations) before using this library in production.
+
+## Features
+
+- Initiator-side TCP sessions with automatic reconnects
+- Logon, Logout, Heartbeat, TestRequest, ResendRequest, and SequenceReset handling
+- Independent inbound and outbound liveness timers
+- Inbound sequence validation, gap buffering, and duplicate suppression
+- Atomic persistence of outbound wire data and the next outbound sequence number
+- Pluggable transport and session-store behaviours
+- Application delivery only after session and sequence validation
+- Pure protocol transitions that can be tested without sockets or processes
 
 ## Installation
 
-If [available in Hex](https://hex.pm/docs/publish), the package can be installed
-by adding `fix_session` to your list of dependencies in `mix.exs`:
+The package is not currently configured for Hex publication. Add the Git repository to your dependencies:
 
 ```elixir
 def deps do
   [
-    {:fix_session, "~> 0.1.0"}
+    {:fix_session, github: "addigence/fix_session"}
   ]
 end
 ```
 
-## Usage
+The project requires Elixir `~> 1.19`.
 
-A session does not start its own store — the store must already be running, and
-must outlive the sessions that use it. Start it first and use `:rest_for_one` so
-sessions restart if the store ever goes down:
+## Getting started
+
+A session does not start or own its store. The store must start first and outlive every session that uses it. Supervise the store and session with `:rest_for_one` so a store failure also restarts dependent sessions:
 
 ```elixir
-config =
-  FIX.Session.Config.new!(
-    session_id: :ibkr,
-    host: "fix.example.com",
-    port: 4001,
-    sender_comp_id: "ME",
-    target_comp_id: "THEM"
-  )
+defmodule MyApp.FIXSupervisor do
+  use Supervisor
 
-children = [
-  {FIX.Session.Store.ETS, file: "/var/lib/fix/ibkr.ets"},
-  {FIX.Session, config}
-]
+  @impl true
+  def start_link(options) do
+    Supervisor.start_link(__MODULE__, options, name: __MODULE__)
+  end
 
-Supervisor.start_link(children, strategy: :rest_for_one)
+  @impl true
+  def init(_options) do
+    config =
+      FIX.Session.Config.new!(
+        session_id: :primary,
+        name: MyApp.FIXSession,
+        host: "fix.example.com",
+        port: 4001,
+        sender_comp_id: "SENDER",
+        target_comp_id: "TARGET",
+        app: MyApp.FIXHandler
+      )
+
+    children = [
+      {FIX.Session.Store.ETS, file: "/var/lib/my_app/fix_session.ets"},
+      {FIX.Session, config}
+    ]
+
+    Supervisor.init(children, strategy: :rest_for_one)
+  end
+end
 ```
 
-`FIX.Session.Store.ETS` is the default store. Its table is owned by the store
-process, so sequence numbers survive a session crash and reconnect. It is not
-crash durable — see its moduledoc for the exact boundary and for the snapshot
-options. `FIX.Session.Store.Memory` is the reference implementation for tests.
+With its default options, `FIX.Session.Store.ETS` creates the named table used by the default `store_ref`, so no additional store configuration is necessary.
 
-Documentation can be generated with [ExDoc](https://github.com/elixir-lang/ex_doc)
-and published on [HexDocs](https://hexdocs.pm). Once published, the docs can
-be found at <https://hexdocs.pm/fix_session>.
+The session connects immediately, sends Logon, and reconnects every five seconds after an ordinary connection failure. A session is available for application messages only after the counterparty's Logon has been accepted.
+
+### Receiving application messages
+
+Set `:app` to a module that exports `handle_message/2`. The callback runs synchronously in the session process and receives the validated `FIX.Message` and session config:
+
+```elixir
+defmodule MyApp.FIXHandler do
+  def handle_message(%FIX.Message{} = message, %FIX.Session.Config{} = config) do
+    send(MyApp.OrderManager, {:fix_message, config.session_id, message})
+    :ok
+  end
+end
+```
+
+Keep this callback fast and non-blocking. If no `:app` module is configured, validated application messages are discarded.
+
+### Sending application messages
+
+Pass a `FIX.Message` to the running session:
+
+```elixir
+message = %FIX.Message{
+  msg_type: "D",
+  body: [
+    # Application fields for NewOrderSingle
+  ]
+}
+
+:ok = FIX.Session.send_message(MyApp.FIXSession, message)
+```
+
+The session assigns and overwrites session-controlled fields, including `BeginString(8)`, `MsgSeqNum(34)`, `SenderCompID(49)`, `SendingTime(52)`, and `TargetCompID(56)`. It persists the encoded message and advances `next_out` before writing to the socket.
+
+Calling `send_message/2` before Logon completes returns:
+
+```elixir
+{:error, {:not_logged_on, current_state}}
+```
+
+### Logging out
+
+```elixir
+:ok = FIX.Session.logout(MyApp.FIXSession, "Application shutdown")
+```
+
+An operator-requested logout is terminal for that process: after the Logout exchange or timeout, it remains disconnected rather than reconnecting automatically. Restart the supervised session to establish a new connection.
+
+## Configuration
+
+Create a validated `%FIX.Session.Config{}` with `FIX.Session.Config.new!/1`.
+
+### Required options
+
+| Option            | Description                                      |
+| ----------------- | ------------------------------------------------ |
+| `:session_id`     | Logical session identifier used as the store key |
+| `:host`           | Counterparty hostname, charlist, or IP tuple     |
+| `:port`           | Counterparty TCP port                            |
+| `:sender_comp_id` | Local `SenderCompID(49)`                         |
+| `:target_comp_id` | Counterparty `TargetCompID(56)`                  |
+
+### Common optional settings
+
+| Option                 | Default                | Description                                                |
+| ---------------------- | ---------------------- | ---------------------------------------------------------- |
+| `:name`                | `nil`                  | Local or registry name passed to `:gen_statem`             |
+| `:begin_string`        | `"FIX.4.4"`            | FIX BeginString                                            |
+| `:heartbeat_interval`  | `30`                   | `HeartBtInt(108)` in seconds; `0` disables liveness timers |
+| `:connect_timeout`     | `10_000`               | Connection timeout in milliseconds                         |
+| `:logon_timeout`       | `10_000`               | Time to wait for the peer's Logon, in milliseconds         |
+| `:logout_timeout`      | `10_000`               | Time to wait for Logout completion, in milliseconds        |
+| `:reconnect_interval`  | `5_000`                | Delay between connection attempts, in milliseconds         |
+| `:transport_options`   | `[]`                   | Additional `:gen_tcp` socket options                       |
+| `:dictionary`          | `FIX.Dictionary.FIX44` | Dictionary used to parse inbound messages                  |
+| `:app`                 | `nil`                  | Application message callback module                        |
+| `:default_appl_ver_id` | `nil`                  | Optional `DefaultApplVerID(1137)` included in Logon        |
+
+Advanced integrations can replace `:transport`, `:store`, and `:store_ref` with modules and references implementing `FIX.Session.Transport` and `FIX.Session.Store`.
+
+## Persistence
+
+`FIX.Session.Store.ETS` is the default store. Its table is owned by a dedicated supervised process, so sequence numbers and outbound messages survive a session-process crash or reconnect.
+
+The ETS store is **not fully crash durable**:
+
+- Without `:file`, state is lost when the store process or VM exits.
+- With `:file`, state is restored at startup and snapshotted during graceful store shutdown.
+- A hard crash can leave the snapshot stale. Restoring stale outbound sequence state can reuse sequence numbers that were already sent.
+
+Use the ETS snapshot only when those guarantees are acceptable. Production deployments requiring crash durability should implement `FIX.Session.Store` with transactional durable storage. `FIX.Session.Store.Memory` is intended for tests and development.
+
+For isolated ETS stores, start the owner with `name: nil`, retrieve its table with `FIX.Session.Store.ETS.table/1`, and pass that table as `:store_ref` in the session config.
+
+## Current limitations
+
+- Initiator sessions only; there is no acceptor/listener implementation.
+- The included transport supports TCP only; TLS is not yet included.
+- FIX 4.4 is the tested/default dictionary and protocol target.
+- Inbound ResendRequests are currently answered with a SequenceReset-GapFill rather than replaying stored business messages.
+- ETS snapshots do not provide hard-crash durability.
+- Session schedules, bounded outbound retention, telemetry, and formal FIX conformance testing are not yet implemented.
+- `reset_on_logon: true` is explicitly unsupported.
+
+## Development
+
+Fetch dependencies and run the test suite:
+
+```sh
+mix deps.get
+mix test
+```
+
+Format and compile with warnings treated as errors:
+
+```sh
+mix format --check-formatted
+mix compile --warnings-as-errors
+```
 
 ## License
 
