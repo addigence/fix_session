@@ -8,14 +8,19 @@ defmodule FIX.Session do
   """
 
   @behaviour :gen_statem
-  require Logger
 
-  alias FIX.Session.{Config, Framing, Messages, Protocol, State}
+  alias FIX.Session.Config
+  alias FIX.Session.Framing
+  alias FIX.Session.Messages
+  alias FIX.Session.Protocol
+  alias FIX.Session.State
+
+  require Logger
 
   defmodule Data do
     @moduledoc false
     @enforce_keys [:config, :protocol]
-    defstruct [:config, :protocol, :socket, buffer: <<>>]
+    defstruct [:config, :protocol, :socket, buffer: <<>>, auto_reconnect: true]
   end
 
   @spec child_spec(Config.t()) :: Supervisor.child_spec()
@@ -47,14 +52,14 @@ defmodule FIX.Session do
   @spec logout(:gen_statem.server_ref(), binary() | nil) :: :ok | {:error, term()}
   def logout(session, text \\ nil), do: :gen_statem.call(session, {:logout, text})
 
+  # ----------------------------------------------------------------------------
+  # Callbacks
+  # ----------------------------------------------------------------------------
+
   @impl true
   def callback_mode, do: [:handle_event_function, :state_enter]
 
   @impl true
-  def init(%Config{reset_on_logon: true}) do
-    {:stop, :reset_on_logon_not_implemented}
-  end
-
   def init(%Config{} = config) do
     case config.store.load(config.store_ref, config.session_id) do
       {:ok, sequences} ->
@@ -77,18 +82,38 @@ defmodule FIX.Session do
 
   @impl true
   def handle_event(:enter, _old_state, :disconnected, data) do
-    data = data |> close() |> reload_sequences()
+    case data |> close() |> reload_sequences() do
+      {:ok, data} ->
+        reconnect =
+          if data.auto_reconnect,
+            do: [{{:timeout, :reconnect}, data.config.reconnect_interval, :retry}],
+            else: []
 
-    {:keep_state, %{data | protocol: %{data.protocol | status: :disconnected}},
-     [
-       {{:timeout, :outbound_idle}, :cancel},
-       {{:timeout, :inbound_idle}, :cancel},
-       {{:timeout, :reconnect}, data.config.reconnect_interval, :retry}
-     ]}
+        {:keep_state, %{data | protocol: %{data.protocol | status: :disconnected}},
+         [
+           {{:timeout, :outbound_idle}, :cancel},
+           {{:timeout, :inbound_idle}, :cancel}
+           | reconnect
+         ]}
+
+      {:error, reason} ->
+        # In-memory sequences may run ahead of the durable ones; carrying on
+        # with them risks reusing or skipping sequence numbers on the next
+        # connection. A restart reloads from the store once it is reachable.
+        {:stop, {:store_load_failed, reason}}
+    end
   end
 
   def handle_event(:enter, _old_state, :connecting, data) do
     {:keep_state, data, [{{:timeout, :reconnect}, :cancel}]}
+  end
+
+  def handle_event(:enter, _old_state, :awaiting_logon, data) do
+    {:keep_state, data, [{:state_timeout, data.config.logon_timeout, :logon}]}
+  end
+
+  def handle_event(:enter, _old_state, :awaiting_logout, data) do
+    {:keep_state, data, [{:state_timeout, data.config.logout_timeout, :logout}]}
   end
 
   def handle_event(:enter, _old_state, :logged_on, data) do
@@ -97,6 +122,12 @@ defmodule FIX.Session do
   end
 
   def handle_event(:enter, _old_state, _state, data), do: {:keep_state, data}
+
+  def handle_event(:state_timeout, :logon, :awaiting_logon, data),
+    do: disconnect(data, :logon_timeout)
+
+  def handle_event(:state_timeout, :logout, :awaiting_logout, data),
+    do: disconnect(data, :logout_timeout)
 
   def handle_event({:timeout, :reconnect}, :retry, :disconnected, data),
     do: {:next_state, :connecting, data, [{:next_event, :internal, :connect}]}
@@ -117,12 +148,15 @@ defmodule FIX.Session do
         protocol = %{data.protocol | status: :awaiting_logon}
         data = %{data | socket: socket, buffer: <<>>, protocol: protocol}
 
-        with {:ok, data} <- emit_new(data, logon_message(config)),
-             :ok <- config.transport.set_active_once(socket) do
-          {:next_state, :awaiting_logon, data}
-        else
-          {:error, reason, data} -> disconnect(data, {:logon_send_failed, reason})
-          {:error, reason} -> disconnect(data, {:transport_activation_failed, reason})
+        case emit_new(data, logon_message(config)) do
+          {:ok, data} ->
+            case config.transport.set_active_once(socket) do
+              :ok -> {:next_state, :awaiting_logon, data}
+              {:error, reason} -> disconnect(data, {:transport_activation_failed, reason})
+            end
+
+          {:error, reason, data} ->
+            disconnect(data, {:logon_send_failed, reason})
         end
 
       {:error, reason} ->
@@ -168,6 +202,12 @@ defmodule FIX.Session do
   def handle_event(:info, {:ssl_closed, socket}, _state, %Data{socket: socket} = data),
     do: disconnect(data, :peer_closed)
 
+  def handle_event(:info, {:tcp_error, socket, reason}, _state, %Data{socket: socket} = data),
+    do: disconnect(data, {:transport_error, reason})
+
+  def handle_event(:info, {:ssl_error, socket, reason}, _state, %Data{socket: socket} = data),
+    do: disconnect(data, {:transport_error, reason})
+
   def handle_event({:call, from}, {:send, message}, :logged_on, data) do
     case emit_new(data, message) do
       {:ok, data} ->
@@ -184,8 +224,11 @@ defmodule FIX.Session do
   def handle_event({:call, from}, {:logout, text}, :logged_on, data) do
     case emit_new(data, Messages.logout(text)) do
       {:ok, data} ->
+        # An operator-requested logout is terminal: once the session
+        # disconnects it must stay down instead of logging straight back on.
         protocol = %{data.protocol | status: :awaiting_logout}
-        {:next_state, :awaiting_logout, %{data | protocol: protocol}, [{:reply, from, :ok}]}
+        data = %{data | protocol: protocol, auto_reconnect: false}
+        {:next_state, :awaiting_logout, data, [{:reply, from, :ok}]}
 
       {:error, reason, data} ->
         {:next_state, :disconnected, close(data), [{:reply, from, {:error, reason}}]}
@@ -199,6 +242,10 @@ defmodule FIX.Session do
     Logger.debug("FIX unhandled #{inspect(kind)} #{inspect(event)} in #{state}")
     :keep_state_and_data
   end
+
+  # ----------------------------------------------------------------------------
+  # Helpers
+  # ----------------------------------------------------------------------------
 
   defp handle_bytes(bytes, state, data) do
     case Framing.drain(data.buffer <> bytes, data.config.dictionary) do
@@ -258,6 +305,12 @@ defmodule FIX.Session do
           {:error, reason, data} -> {:halt, {:disconnect, {:send_failed, reason}, data}}
         end
 
+      {:send_replay, message}, {:ok, data} ->
+        case emit_replay(data, message) do
+          {:ok, data} -> {:cont, {:ok, data}}
+          {:error, reason, data} -> {:halt, {:disconnect, {:send_failed, reason}, data}}
+        end
+
       {:deliver, message}, {:ok, data} ->
         deliver(message, data.config)
         {:cont, {:ok, data}}
@@ -303,10 +356,32 @@ defmodule FIX.Session do
     end
   end
 
+  # Retransmissions carry their own MsgSeqNum and consume no new outbound
+  # sequence number, so nothing is committed to the store.
+  defp emit_replay(%Data{socket: nil} = data, _message), do: {:error, :not_connected, data}
+
+  defp emit_replay(data, %FIX.Message{} = message) do
+    config = data.config
+    now = utc_timestamp()
+
+    message = %{
+      message
+      | begin_string: config.begin_string,
+        sender_comp_id: config.sender_comp_id,
+        target_comp_id: config.target_comp_id,
+        sending_time: now,
+        orig_sending_time: message.orig_sending_time || now
+    }
+
+    case config.transport.send(data.socket, FIX.Message.to_fix(message)) do
+      :ok -> {:ok, data}
+      {:error, reason} -> {:error, reason, data}
+    end
+  end
+
   defp logon_message(config) do
     body =
       [{98, "0"}, {108, Integer.to_string(config.heartbeat_interval)}] ++
-        if(config.reset_on_logon, do: [{141, "Y"}], else: []) ++
         if(config.default_appl_ver_id, do: [{1137, config.default_appl_ver_id}], else: [])
 
     %FIX.Message{msg_type: "A", body: body}
@@ -345,11 +420,11 @@ defmodule FIX.Session do
             outstanding_resend: nil
         }
 
-        %{data | protocol: protocol}
+        {:ok, %{data | protocol: protocol}}
 
       {:error, reason} ->
         Logger.error("FIX failed to reload sequence state: #{inspect(reason)}")
-        data
+        {:error, reason}
     end
   end
 
@@ -357,7 +432,8 @@ defmodule FIX.Session do
 
   defp close(data) do
     _ = data.config.transport.close(data.socket)
-    %{data | socket: nil, buffer: <<>>, protocol: %{data.protocol | pending_inbound: %{}}}
+    protocol = %{data.protocol | pending_inbound: %{}, pending_test_request: nil}
+    %{data | socket: nil, buffer: <<>>, protocol: protocol}
   end
 
   defp utc_timestamp do

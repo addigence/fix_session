@@ -138,6 +138,150 @@ defmodule FIX.Session.ProtocolTest do
              {:disconnect, :sequence_too_low}
            ]
   end
+
+  test "rejects a non-Logon first message even when it carries a sequence gap" do
+    state = %State{status: :awaiting_logon, next_in: 1}
+
+    {state, actions} = Protocol.handle_message(%FIX.Message{msg_type: "8", seq_num: 5}, state)
+
+    assert state.status == :awaiting_logon
+    assert actions == [{:disconnect, :first_message_not_logon}]
+  end
+
+  test "logs on from a Logon with a sequence gap and recovers the gap afterwards" do
+    state = %State{status: :awaiting_logon, next_in: 1, next_out: 2}
+    logon = %FIX.Message{msg_type: "A", seq_num: 5}
+
+    {state, actions} = Protocol.handle_message(logon, state)
+
+    assert state.status == :logged_on
+    assert state.next_in == 1
+    assert state.pending_inbound == %{5 => logon}
+    assert actions == [{:send_new, Messages.resend_request(1, 4)}]
+
+    # The replayed pre-logon messages must deliver, not disconnect.
+    replayed = %FIX.Message{msg_type: "8", seq_num: 1}
+    {state, actions} = Protocol.handle_message(replayed, state)
+
+    assert state.next_in == 2
+    assert actions == [{:persist_inbound, 2}, {:deliver, replayed}]
+  end
+
+  test "consumes a buffered Logon when the gap closes without delivering it" do
+    logon = %FIX.Message{msg_type: "A", seq_num: 2}
+    one = %FIX.Message{msg_type: "8", seq_num: 1}
+
+    state = %State{
+      status: :logged_on,
+      next_in: 1,
+      pending_inbound: %{2 => logon},
+      outstanding_resend: {1, 1}
+    }
+
+    {state, actions} = Protocol.handle_message(one, state)
+
+    assert state.next_in == 3
+    assert state.pending_inbound == %{}
+    assert actions == [{:persist_inbound, 2}, {:deliver, one}, {:persist_inbound, 3}]
+  end
+
+  test "SequenceReset-GapFill in sequence jumps next_in to NewSeqNo" do
+    state = %State{status: :logged_on, next_in: 5}
+    gap_fill = %FIX.Message{msg_type: "4", seq_num: 5, body: [{123, "Y"}, {36, "8"}]}
+
+    {state, actions} = Protocol.handle_message(gap_fill, state)
+
+    assert state.next_in == 8
+    assert actions == [{:persist_inbound, 8}]
+  end
+
+  test "SequenceReset-GapFill releases a buffered message waiting behind the gap" do
+    eight = %FIX.Message{msg_type: "8", seq_num: 8}
+
+    state = %State{
+      status: :logged_on,
+      next_in: 5,
+      pending_inbound: %{8 => eight},
+      outstanding_resend: {5, 7}
+    }
+
+    gap_fill = %FIX.Message{msg_type: "4", seq_num: 5, body: [{123, "Y"}, {36, "8"}]}
+
+    {state, actions} = Protocol.handle_message(gap_fill, state)
+
+    assert state.next_in == 9
+    assert state.pending_inbound == %{}
+    assert state.outstanding_resend == nil
+    assert actions == [{:persist_inbound, 8}, {:persist_inbound, 9}, {:deliver, eight}]
+  end
+
+  test "disconnects on a SequenceReset-GapFill that does not advance the sequence" do
+    state = %State{status: :logged_on, next_in: 5}
+    gap_fill = %FIX.Message{msg_type: "4", seq_num: 5, body: [{123, "Y"}, {36, "5"}]}
+
+    {_state, actions} = Protocol.handle_message(gap_fill, state)
+
+    assert List.last(actions) == {:disconnect, :invalid_sequence_reset}
+  end
+
+  test "SequenceReset-Reset applies regardless of a sequence gap" do
+    state = %State{
+      status: :logged_on,
+      next_in: 5,
+      pending_inbound: %{7 => %FIX.Message{msg_type: "8", seq_num: 7}},
+      outstanding_resend: {5, 6}
+    }
+
+    reset = %FIX.Message{msg_type: "4", seq_num: 999, body: [{36, "50"}]}
+
+    {state, actions} = Protocol.handle_message(reset, state)
+
+    assert state.next_in == 50
+    assert state.pending_inbound == %{}
+    assert state.outstanding_resend == nil
+    assert actions == [{:persist_inbound, 50}]
+  end
+
+  test "disconnects on a SequenceReset-Reset that would move the sequence backwards" do
+    state = %State{status: :logged_on, next_in: 5}
+    reset = %FIX.Message{msg_type: "4", seq_num: 4, body: [{36, "3"}]}
+
+    {_state, actions} = Protocol.handle_message(reset, state)
+
+    assert actions == [{:disconnect, :sequence_reset_below_expected}]
+  end
+
+  test "answers an inbound ResendRequest with a single SequenceReset-GapFill" do
+    state = %State{status: :logged_on, next_in: 3, next_out: 10}
+    request = %FIX.Message{msg_type: "2", seq_num: 3, body: [{7, "4"}, {16, "0"}]}
+
+    {state, actions} = Protocol.handle_message(request, state)
+
+    assert state.next_in == 4
+
+    assert actions == [
+             {:persist_inbound, 4},
+             {:send_replay, Messages.sequence_reset_gap_fill(4, 10)}
+           ]
+  end
+
+  test "disconnects on a ResendRequest for messages that were never sent" do
+    state = %State{status: :logged_on, next_in: 3, next_out: 10}
+    request = %FIX.Message{msg_type: "2", seq_num: 3, body: [{7, "10"}, {16, "12"}]}
+
+    {_state, actions} = Protocol.handle_message(request, state)
+
+    assert List.last(actions) == {:disconnect, :invalid_resend_request}
+  end
+
+  test "any inbound message answers an outstanding TestRequest" do
+    state = %State{status: :logged_on, next_in: 5, pending_test_request: "TR-1"}
+
+    # An application message, not a Heartbeat: liveness is proven either way.
+    {state, _actions} = Protocol.handle_message(%FIX.Message{msg_type: "8", seq_num: 5}, state)
+
+    assert state.pending_test_request == nil
+  end
 end
 
 defmodule FIX.Session.StateMachineTest do
@@ -146,30 +290,49 @@ defmodule FIX.Session.StateMachineTest do
   alias FIX.Session.{Config, Store.ETS}
 
   # store defaults to Store.ETS, so only store_ref is passed here.
-  defp config(store) do
+  defp config(store, overrides \\ []) do
     Config.new!(
-      session_id: :ibkr,
-      host: "localhost",
-      port: 5001,
-      sender_comp_id: "ADDIGENCE",
-      target_comp_id: "IBKR",
-      heartbeat_interval: 0,
-      transport: FIX.Session.TestTransport,
-      transport_options: [owner: self()],
-      store_ref: store
+      Keyword.merge(
+        [
+          session_id: :ibkr,
+          host: "localhost",
+          port: 5001,
+          sender_comp_id: "ADDIGENCE",
+          target_comp_id: "IBKR",
+          heartbeat_interval: 0,
+          transport: FIX.Session.TestTransport,
+          transport_options: [owner: self()],
+          store_ref: store
+        ],
+        overrides
+      )
     )
   end
 
-  defp logon_ack do
+  defp peer_message(msg_type, seq_num, body \\ []) do
     FIX.Message.to_fix(%FIX.Message{
       begin_string: "FIX.4.4",
-      msg_type: "A",
-      seq_num: 1,
+      msg_type: msg_type,
+      seq_num: seq_num,
       sender_comp_id: "IBKR",
       target_comp_id: "ADDIGENCE",
       sending_time: "20260727-10:00:00.000",
-      body: [{98, "0"}, {108, "0"}]
+      body: body
     })
+  end
+
+  defp logon_ack, do: peer_message("A", 1, [{98, "0"}, {108, "0"}])
+
+  # Drives the session through its opening Logon exchange; returns the socket.
+  defp log_on!(session) do
+    assert_receive {:transport_sent, _logon_wire}
+    assert_receive :transport_active_once
+
+    {_state, data} = :sys.get_state(session)
+    send(session, {:tcp, data.socket, logon_ack()})
+
+    assert_receive :transport_active_once
+    data.socket
   end
 
   setup do
@@ -262,6 +425,114 @@ defmodule FIX.Session.StateMachineTest do
     assert {:ok, resumed_logon, <<>>} = FIX.Message.parse(resumed_logon_wire)
     assert resumed_logon.msg_type == "A"
     assert resumed_logon.seq_num == 3
+  end
+
+  @tag :capture_log
+  test "tears down and reconnects when the Logon is never answered", %{store: store} do
+    start_supervised!({FIX.Session, config(store, logon_timeout: 50, reconnect_interval: 25)})
+
+    assert_receive {:transport_sent, _logon_wire}
+    assert_receive :transport_active_once
+
+    assert_receive :transport_closed, 500
+    assert_receive {:transport_sent, _retry_logon_wire}, 500
+  end
+
+  @tag :capture_log
+  test "disconnects after the logout timeout when the peer never acknowledges", %{store: store} do
+    session =
+      start_supervised!({FIX.Session, config(store, logout_timeout: 50, reconnect_interval: 25)})
+
+    log_on!(session)
+
+    assert :ok = FIX.Session.logout(session)
+    assert_receive {:transport_sent, logout_wire}
+    assert {:ok, %FIX.Message{msg_type: "5"}, <<>>} = FIX.Message.parse(logout_wire)
+
+    assert_receive :transport_closed, 500
+    # An operator logout is terminal: no automatic re-logon afterwards.
+    refute_receive {:transport_sent, _anything}, 200
+    assert {:disconnected, _data} = :sys.get_state(session)
+  end
+
+  @tag :capture_log
+  test "stays down after a completed logout", %{store: store} do
+    session = start_supervised!({FIX.Session, config(store, reconnect_interval: 25)})
+    socket = log_on!(session)
+
+    assert :ok = FIX.Session.logout(session)
+    assert_receive {:transport_sent, _logout_wire}
+    send(session, {:tcp, socket, peer_message("5", 2)})
+
+    assert_receive :transport_closed, 500
+    refute_receive {:transport_sent, _anything}, 200
+    assert {:disconnected, _data} = :sys.get_state(session)
+  end
+
+  @tag :capture_log
+  test "treats a transport error like a closed connection", %{store: store} do
+    session = start_supervised!({FIX.Session, config(store, reconnect_interval: 25)})
+    socket = log_on!(session)
+
+    send(session, {:tcp_error, socket, :etimedout})
+
+    assert_receive :transport_closed, 500
+    assert_receive {:transport_sent, _retry_logon_wire}, 500
+  end
+
+  @tag :capture_log
+  test "clears an outstanding TestRequest when the connection drops", %{store: store} do
+    session = start_supervised!({FIX.Session, config(store)})
+    socket = log_on!(session)
+
+    :sys.replace_state(session, fn {state, data} ->
+      {state, %{data | protocol: %{data.protocol | pending_test_request: "TR-stale"}}}
+    end)
+
+    send(session, {:tcp_closed, socket})
+    assert_receive :transport_closed, 500
+
+    assert {:disconnected, data} = :sys.get_state(session)
+    assert data.protocol.pending_test_request == nil
+  end
+
+  test "answers a ResendRequest with a GapFill without consuming a sequence number",
+       %{store: store} do
+    session = start_supervised!({FIX.Session, config(store)})
+    socket = log_on!(session)
+
+    assert :ok = FIX.Session.send_message(session, %FIX.Message{msg_type: "D"})
+    assert_receive {:transport_sent, _order_wire}
+    assert {:ok, %{next_out: 3}} = ETS.load(store, :ibkr)
+
+    send(session, {:tcp, socket, peer_message("2", 2, [{7, "1"}, {16, "2"}])})
+
+    assert_receive {:transport_sent, gap_fill_wire}
+    assert {:ok, gap_fill, <<>>} = FIX.Message.parse(gap_fill_wire)
+    assert gap_fill.msg_type == "4"
+    assert gap_fill.seq_num == 1
+    assert gap_fill.poss_dup_flag == true
+    assert {123, "Y"} in gap_fill.body
+    assert {36, "3"} in gap_fill.body
+
+    # The retransmission allocated no new outbound sequence number.
+    assert {:ok, %{next_out: 3}} = ETS.load(store, :ibkr)
+    assert :error = ETS.get_outbound(store, :ibkr, 3)
+  end
+
+  @tag :capture_log
+  test "stops rather than continuing on stale sequences when the store is unreachable" do
+    Process.flag(:trap_exit, true)
+    owner = start_supervised!(Supervisor.child_spec({ETS, name: nil}, id: :doomed_store))
+    store = ETS.table(owner)
+
+    {:ok, session} = FIX.Session.start_link(config(store))
+    socket = log_on!(session)
+
+    :ok = stop_supervised(:doomed_store)
+    send(session, {:tcp_closed, socket})
+
+    assert_receive {:EXIT, ^session, {:store_load_failed, :store_unavailable}}, 500
   end
 end
 
