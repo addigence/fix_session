@@ -13,6 +13,7 @@ defmodule FIX.Session.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       package: package(),
+      docs: docs(),
       description: description(),
       source_url: @repo_url,
       homepage_url: @repo_url
@@ -44,6 +45,13 @@ defmodule FIX.Session.MixProject do
       links: %{
         "GitHub" => "https://github.com/addigence/session"
       }
+    ]
+  end
+
+  defp docs do
+    [
+      main: "readme",
+      extras: ["README.md"]
     ]
   end
 
