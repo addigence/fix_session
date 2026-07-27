@@ -19,15 +19,17 @@ An initiator-side [FIX](https://www.fixtrading.org/standards/) session engine fo
 
 ## Installation
 
-The package is not currently configured for Hex publication. Add the Git repository to your dependencies:
+Add [`fix_session`](https://hex.pm/packages/fix_session) to your dependencies in `mix.exs`:
 
 ```elixir
 def deps do
   [
-    {:fix_session, github: "addigence/fix_session"}
+    {:fix_session, "~> 0.1.0"}
   ]
 end
 ```
+
+Then fetch the dependency with `mix deps.get`.
 
 The project requires Elixir `~> 1.19`.
 

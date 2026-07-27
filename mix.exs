@@ -2,7 +2,7 @@ defmodule FIX.Session.MixProject do
   use Mix.Project
   @version "0.1.1"
 
-    @repo_url "https://github.com/addigence/fix_session"
+  @repo_url "https://github.com/addigence/fix_session"
 
   def project do
     [
@@ -13,9 +13,9 @@ defmodule FIX.Session.MixProject do
       elixirc_paths: elixirc_paths(Mix.env()),
       deps: deps(),
       package: package(),
-            description: description(),
-            source_url: @repo_url,
-            homepage_url: @repo_url
+      description: description(),
+      source_url: @repo_url,
+      homepage_url: @repo_url
     ]
   end
 
@@ -43,8 +43,7 @@ defmodule FIX.Session.MixProject do
       licenses: ["Apache-2.0"],
       links: %{
         "GitHub" => "https://github.com/addigence/session"
-      },
-      files: ~w(lib mix.exs README.md LICENSE)
+      }
     ]
   end
 
