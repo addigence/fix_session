@@ -1,14 +1,21 @@
 defmodule FIX.Session.MixProject do
   use Mix.Project
+  @version "0.1.1"
+
+    @repo_url "https://github.com/addigence/fix_session"
 
   def project do
     [
       app: :fix_session,
-      version: "0.1.0",
+      version: @version,
       elixir: "~> 1.19",
       start_permanent: Mix.env() == :prod,
       elixirc_paths: elixirc_paths(Mix.env()),
-      deps: deps()
+      deps: deps(),
+      package: package(),
+            description: description(),
+            source_url: @repo_url,
+            homepage_url: @repo_url
     ]
   end
 
@@ -26,7 +33,22 @@ defmodule FIX.Session.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
-      {:fix_message, "~> 0.1"}
+      {:fix_message, "~> 0.1"},
+      {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
+  end
+
+  defp package do
+    [
+      licenses: ["Apache-2.0"],
+      links: %{
+        "GitHub" => "https://github.com/addigence/session"
+      },
+      files: ~w(lib mix.exs README.md LICENSE)
+    ]
+  end
+
+  defp description do
+    "An initiator-side FIX session engine for Elixir."
   end
 end
