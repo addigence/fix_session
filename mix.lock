@@ -1,0 +1,3 @@
+%{
+  "fix_message": {:hex, :fix_message, "0.1.1", "f358e7fea3152fe8eb9c1682fc6c844fe6c9ec6b11fd0aabf4b4333199132b95", [:mix], [], "hexpm", "d76455ee97f5523823e52986cfc9a98ddce24e9b1e01deca1e668822184425d9"},
+}
