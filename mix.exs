@@ -1,6 +1,7 @@
 defmodule FIX.Session.MixProject do
   use Mix.Project
-  @version "0.1.1"
+
+  @version "0.1.2"
 
   @repo_url "https://github.com/addigence/fix_session"
 
@@ -26,7 +27,7 @@ defmodule FIX.Session.MixProject do
   # Run "mix help compile.app" to learn about applications.
   def application do
     [
-      extra_applications: [:logger],
+      extra_applications: [:logger, :ssl, :public_key],
       mod: {FIX.Session.Application, []}
     ]
   end

@@ -144,12 +144,27 @@ Create a validated `%FIX.Session.Config{}` with `FIX.Session.Config.new!/1`.
 | `:logon_timeout`       | `10_000`               | Time to wait for the peer's Logon, in milliseconds         |
 | `:logout_timeout`      | `10_000`               | Time to wait for Logout completion, in milliseconds        |
 | `:reconnect_interval`  | `5_000`                | Delay between connection attempts, in milliseconds         |
-| `:transport_options`   | `[]`                   | Additional `:gen_tcp` socket options                       |
+| `:transport_options`   | `[]`                   | Options for the configured transport (`:gen_tcp` or `:ssl`) |
 | `:dictionary`          | `FIX.Dictionary.FIX44` | Dictionary used to parse inbound messages                  |
 | `:app`                 | `nil`                  | Application message callback module                        |
 | `:default_appl_ver_id` | `nil`                  | Optional `DefaultApplVerID(1137)` included in Logon        |
 
 Advanced integrations can replace `:transport`, `:store`, and `:store_ref` with modules and references implementing `FIX.Session.Transport` and `FIX.Session.Store`.
+
+### TLS
+
+`FIX.Session.Transport.TLS` connects over `:ssl` with peer verification against the OS trust store by default:
+
+```elixir
+config =
+  FIX.Session.Config.new!(
+    # ...
+    transport: FIX.Session.Transport.TLS,
+    transport_options: [cacertfile: "/etc/fix/counterparty_ca.pem"]
+  )
+```
+
+Pass `:cacertfile` or `:cacerts` to pin a counterparty CA (common with self-signed FIX endpoints), or `verify: :verify_none` to disable verification entirely. See the `FIX.Session.Transport.TLS` docs for the full list of defaults and how to override them.
 
 ## Persistence
 
@@ -168,7 +183,6 @@ For isolated ETS stores, start the owner with `name: nil`, retrieve its table wi
 ## Current limitations
 
 - Initiator sessions only; there is no acceptor/listener implementation.
-- The included transport supports TCP only; TLS is not yet included.
 - FIX 4.4 is the tested/default dictionary and protocol target.
 - Inbound ResendRequests are currently answered with a SequenceReset-GapFill rather than replaying stored business messages.
 - ETS snapshots do not provide hard-crash durability.
