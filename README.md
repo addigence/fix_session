@@ -176,7 +176,7 @@ The ETS store is **not fully crash durable**:
 - With `:file`, state is restored at startup and snapshotted during graceful store shutdown.
 - A hard crash can leave the snapshot stale. Restoring stale outbound sequence state can reuse sequence numbers that were already sent.
 
-Use the ETS snapshot only when those guarantees are acceptable. Production deployments requiring crash durability should use `FIX.Session.Store.EKV` (below) or implement `FIX.Session.Store` with transactional durable storage. `FIX.Session.Store.Memory` is intended for tests and development.
+Use the ETS snapshot only when those guarantees are acceptable. Production deployments requiring crash durability should use `FIX.Session.Store.EKV` or `FIX.Session.Store.Postgres` (below), or implement `FIX.Session.Store` with transactional durable storage. `FIX.Session.Store.Memory` is intended for tests and development.
 
 For isolated ETS stores, start the owner with `name: nil`, retrieve its table with `FIX.Session.Store.ETS.table/1`, and pass that table as `:store_ref` in the session config.
 
@@ -199,12 +199,46 @@ children = [
 
 Reusing the same `:data_dir` across restarts resumes the persisted session state. See the `FIX.Session.Store.EKV` docs for options and durability details.
 
+### Durable storage with Postgres
+
+`FIX.Session.Store.Postgres` persists sequence numbers and outbound messages through the host application's `Ecto.Repo`, committing each outbound message and its advanced sequence number in a single database transaction. It requires the optional `:ecto_sql` and `:postgrex` dependencies:
+
+```elixir
+{:ecto_sql, "~> 3.10"},
+{:postgrex, "~> 0.19"}
+```
+
+Create the tables from a migration in your application:
+
+```elixir
+defmodule MyApp.Repo.Migrations.AddFixSessionTables do
+  use Ecto.Migration
+
+  def up, do: FIX.Session.Store.Postgres.Migrations.up()
+  def down, do: FIX.Session.Store.Postgres.Migrations.down()
+end
+```
+
+The store owns no processes — pass your repo as the `store_ref` and supervise it before the session:
+
+```elixir
+children = [
+  MyApp.Repo,
+  {FIX.Session,
+   FIX.Session.Config.new!(
+     store: FIX.Session.Store.Postgres,
+     store_ref: MyApp.Repo,
+     # ...
+   )}
+]
+```
+
 ## Current limitations
 
 - Initiator sessions only; there is no acceptor/listener implementation.
 - FIX 4.4 is the tested/default dictionary and protocol target.
 - Inbound ResendRequests are currently answered with a SequenceReset-GapFill rather than replaying stored business messages.
-- ETS snapshots do not provide hard-crash durability; use `FIX.Session.Store.EKV` when you need a durable store.
+- ETS snapshots do not provide hard-crash durability; use `FIX.Session.Store.EKV` or `FIX.Session.Store.Postgres` when you need a durable store.
 - Session schedules, bounded outbound retention, telemetry, and formal FIX conformance testing are not yet implemented.
 - `reset_on_logon: true` is explicitly unsupported.
 
@@ -216,6 +250,8 @@ Fetch dependencies and run the test suite:
 mix deps.get
 mix test
 ```
+
+The `FIX.Session.Store.Postgres` tests need a reachable Postgres server (`FIX_SESSION_PG_URL`, defaulting to `postgres://postgres:postgres@localhost:5432/fix_session_test`); without one they are skipped with a warning.
 
 Format and compile with warnings treated as errors:
 
