@@ -176,16 +176,35 @@ The ETS store is **not fully crash durable**:
 - With `:file`, state is restored at startup and snapshotted during graceful store shutdown.
 - A hard crash can leave the snapshot stale. Restoring stale outbound sequence state can reuse sequence numbers that were already sent.
 
-Use the ETS snapshot only when those guarantees are acceptable. Production deployments requiring crash durability should implement `FIX.Session.Store` with transactional durable storage. `FIX.Session.Store.Memory` is intended for tests and development.
+Use the ETS snapshot only when those guarantees are acceptable. Production deployments requiring crash durability should use `FIX.Session.Store.EKV` (below) or implement `FIX.Session.Store` with transactional durable storage. `FIX.Session.Store.Memory` is intended for tests and development.
 
 For isolated ETS stores, start the owner with `name: nil`, retrieve its table with `FIX.Session.Store.ETS.table/1`, and pass that table as `:store_ref` in the session config.
+
+### Durable storage with EKV
+
+`FIX.Session.Store.EKV` persists sequence numbers and outbound messages to SQLite through [EKV](https://hex.pm/packages/ekv), so state survives store and VM crashes. It requires the optional `:ekv` dependency (which ships a vendored, precompiled SQLite NIF):
+
+```elixir
+{:ekv, "~> 0.4"}
+```
+
+Supervise it in place of the ETS store and select it in the session config:
+
+```elixir
+children = [
+  {FIX.Session.Store.EKV, data_dir: "/var/lib/my_app/fix_session"},
+  {FIX.Session, FIX.Session.Config.new!(store: FIX.Session.Store.EKV, ...)}
+]
+```
+
+Reusing the same `:data_dir` across restarts resumes the persisted session state. See the `FIX.Session.Store.EKV` docs for options and durability details.
 
 ## Current limitations
 
 - Initiator sessions only; there is no acceptor/listener implementation.
 - FIX 4.4 is the tested/default dictionary and protocol target.
 - Inbound ResendRequests are currently answered with a SequenceReset-GapFill rather than replaying stored business messages.
-- ETS snapshots do not provide hard-crash durability.
+- ETS snapshots do not provide hard-crash durability; use `FIX.Session.Store.EKV` when you need a durable store.
 - Session schedules, bounded outbound retention, telemetry, and formal FIX conformance testing are not yet implemented.
 - `reset_on_logon: true` is explicitly unsupported.
 
