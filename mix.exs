@@ -33,9 +33,9 @@ defmodule FIX.Session.MixProject do
   # Run "mix help deps" to learn about dependencies.
   defp deps do
     [
+      {:fix_message, "~> 0.1"},
       {:ecto_sql, "~> 3.10", optional: true},
       {:ekv, "~> 0.4", optional: true},
-      {:fix_message, "~> 0.1"},
       {:postgrex, "~> 0.19", optional: true},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
